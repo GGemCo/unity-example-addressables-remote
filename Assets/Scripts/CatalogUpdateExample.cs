@@ -1,4 +1,5 @@
-﻿using System.Collections.Generic;
+﻿using System;
+using System.Collections.Generic;
 using System.Linq;
 using TMPro;
 using UnityEngine;
@@ -257,68 +258,35 @@ public class CatalogUpdateExample : MonoBehaviour
     public void OnClickDownloadStart()
     {
         var keys = BuildDownloadKeys();
-        if (keys.Count == 0)
-        {
-            Debug.LogError("[Addr] 다운로드 대상 키가 없습니다.");
-            UpdateProgressUI(0f, "No Targets");
-            return;
-        }
+        if (keys.Count == 0) { UpdateProgressUI(0f, "No Targets"); return; }
 
-        var locHandle = Addressables.LoadResourceLocationsAsync(keys, Addressables.MergeMode.Union);
-        if (!locHandle.IsValid())
-        {
-            Debug.LogError("[Addr] LoadResourceLocationsAsync: 핸들 무효");
-            return;
-        }
-
-        // 로케이션 → 다운로드
-        locHandle.Completed += locationsOp =>
-        {
-            if (!locationsOp.IsValid() || locationsOp.Status != AsyncOperationStatus.Succeeded)
+        ResolveRemoteBundleLocations(
+            keys,
+            onSuccess: remoteBundles =>
             {
-                Debug.LogError("[Addr] LoadResourceLocations 실패");
-                return;
-            }
-
-            IList<IResourceLocation> locations = locationsOp.Result;
-
-            // 실제 다운로드(번들 단위). 'true'는 동일 의존성 중복 로드 동작을 허용하는 플래그로, 캐시 있는 번들은 내려받지 않음.
-            var dlHandle = Addressables.DownloadDependenciesAsync(locations, true);
-            if (!dlHandle.IsValid())
-            {
-                Debug.LogError("[Addr] DownloadDependenciesAsync(locations): 핸들 무효");
-                if (locationsOp.IsValid()) Addressables.Release(locationsOp);
-                return;
-            }
-
-            // 진행률 트래킹 시작
-            BeginProgress(dlHandle, "Download");
-
-            // 완료 처리
-            dlHandle.Completed += op =>
-            {
-                EndProgress("Download Complete");
-
-                if (op.IsValid())
+                if (remoteBundles.Count == 0)
                 {
-                    if (op.Status == AsyncOperationStatus.Succeeded) {
-                        Debug.Log("다운로드 완료");
-                    }
-                    else
-                        Debug.Log($"다운로드 실패 - {op.Status}");
-
-                    // 다운로드 핸들 해제(중요)
-                    Addressables.Release(op);
-                }
-                else
-                {
-                    Debug.Log("[Addr] DownloadDependencies Completed: 핸들 무효");
+                    UpdateProgressUI(1f, "Nothing to download");
+                    return;
                 }
 
-                // 로케이션 핸들 해제
-                if (locationsOp.IsValid()) Addressables.Release(locationsOp);
-            };
-        };
+                var dlHandle = Addressables.DownloadDependenciesAsync(remoteBundles, true);
+                if (!dlHandle.IsValid())
+                {
+                    Debug.LogError("[Addr] DownloadDependenciesAsync(remoteBundles): invalid handle");
+                    return;
+                }
+
+                BeginProgress(dlHandle, "Download");
+                dlHandle.Completed += op =>
+                {
+                    EndProgress("Download Complete");
+                    Debug.Log("다운로드 완료");
+                    if (op.IsValid()) Addressables.Release(op);
+                };
+            },
+            onError: msg => Debug.LogError("[Addr] " + msg)
+        );
     }
 
     // ======================================================================
@@ -464,6 +432,86 @@ public class CatalogUpdateExample : MonoBehaviour
             // 주의: LoadAssetAsync 핸들은 Result를 더 이상 사용하지 않을 때 Release 필요
             // 여기서는 임시 데모이므로 즉시 Release하지 않았음. 실제 코드에선 참조 정책에 맞춰 Release를 호출하세요.
             // Addressables.Release(op);
+        };
+    }
+    // ===[1] 원격 번들 판별 유틸 ===
+    private static bool IsBundle(IResourceLocation loc)
+    {
+        return loc != null &&
+               loc.ResourceType == typeof(UnityEngine.ResourceManagement.ResourceProviders.IAssetBundleResource);
+    }
+
+    private static bool IsRemote(IResourceLocation loc)
+    {
+        if (loc == null) return false;
+        var id = loc.InternalId ?? string.Empty;
+        // 가장 안전한 1차 판별: URL 스킴
+        if (id.StartsWith("http://", StringComparison.OrdinalIgnoreCase) ||
+            id.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        // (선택) RemoteLoadPath 접두 검증이 필요하면 아래처럼 보강
+        // var expandedRemote = Addressables.ResolveInternalId("{{YourRemoteLoadPath}}");
+        // if (!string.IsNullOrEmpty(expandedRemote) && id.StartsWith(expandedRemote, StringComparison.OrdinalIgnoreCase))
+        //     return true;
+
+        return false;
+    }
+
+    // ===[2] 그래프(의존성 포함)에서 "원격 번들"만 추려내기 ===
+    private static List<IResourceLocation> CollectRemoteBundlesDeep(IEnumerable<IResourceLocation> roots)
+    {
+        var result = new HashSet<IResourceLocation>();
+        var visited = new HashSet<IResourceLocation>();
+        var stack = new Stack<IResourceLocation>(roots.Where(l => l != null));
+
+        while (stack.Count > 0)
+        {
+            var loc = stack.Pop();
+            if (!visited.Add(loc)) continue;
+
+            if (IsBundle(loc) && IsRemote(loc))
+                result.Add(loc);
+
+            if (loc.Dependencies != null)
+                foreach (var d in loc.Dependencies)
+                    if (d != null)
+                        stack.Push(d);
+        }
+
+        return result.ToList();
+    }
+
+    // ===[3] 키 집합 → 원격 번들 로케이션만 해석 ===
+    private void ResolveRemoteBundleLocations(
+        List<object> keys,
+        Action<IList<IResourceLocation>> onSuccess,
+        Action<string> onError = null)
+    {
+        var locHandle = Addressables.LoadResourceLocationsAsync(keys, Addressables.MergeMode.Union);
+        if (!locHandle.IsValid())
+        {
+            onError?.Invoke("LoadResourceLocationsAsync: invalid handle");
+            return;
+        }
+
+        locHandle.Completed += op =>
+        {
+            if (!op.IsValid() || op.Status != AsyncOperationStatus.Succeeded)
+            {
+                onError?.Invoke("LoadResourceLocationsAsync failed");
+                return;
+            }
+
+            try
+            {
+                var remoteBundles = CollectRemoteBundlesDeep(op.Result);
+                onSuccess?.Invoke(remoteBundles);
+            }
+            finally
+            {
+                if (op.IsValid()) Addressables.Release(op);
+            }
         };
     }
 }
